@@ -1,0 +1,11 @@
+apple
+orange
+grape
+pineapple
+apple
+apple
+apple
+grape
+grape
+avocado
+strawberry
