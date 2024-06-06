@@ -1,0 +1,17 @@
+# MongoDB driver for Python
+pymongo
+
+# Advanced Python Scheduler
+apscheduler
+
+# Streamlit for the web application
+streamlit
+
+# Apache Spark
+pyspark
+
+# Utility for date and time handling 
+datetime
+
+# Logging configuration (standard library)
+logging
