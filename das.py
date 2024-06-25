@@ -6,44 +6,43 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
 import streamlit as st
 import atexit
+import subprocess
 from pyspark.sql import SparkSession
 
-# MongoDB connection settings
-MONGO_CONNECTION_STRING = os.getenv("MONGO_CONNECTION_STRING", "mongodb+srv://Asif_Asees:root@das-cluster.tccl6d2.mongodb.net/")
-LOG_DATABASE_NAME = "DAS-database"
-LOG_COLLECTION_NAME = "logs"
-SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://0.0.0.0:7077")
-MAX_RETRIES = 3
+# Custom MongoDB logging handler
+class MongoDBHandler(logging.Handler):
+    def __init__(self, connection_string, database_name, collection_name):
+        logging.Handler.__init__(self)
+        client = MongoClient(connection_string)
+        self.db = client[database_name]
+        self.collection = self.db[collection_name]
 
-# Function to log messages to MongoDB
-def log_to_mongodb(level, message):
-    try:
-        client = MongoClient(MONGO_CONNECTION_STRING)
-        db = client[LOG_DATABASE_NAME]
-        collection = db[LOG_COLLECTION_NAME]
-        log_data = {
-            "message": message,
-            "level": level,
-            "timestamp": datetime.now()
-        }
-        collection.insert_one(log_data)
-    except Exception as e:
-        logging.error(f"Failed to log message to MongoDB: {e}")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Custom log handler to call log_to_mongodb function
-class MongoDBLoggingHandler(logging.Handler):
     def emit(self, record):
         log_entry = self.format(record)
-        log_to_mongodb(record.levelname, log_entry)
+        log_data = {
+            "message": log_entry,
+            "level": record.levelname,
+            "timestamp": datetime.now()
+        }
+        self.collection.insert_one(log_data)
 
-mongo_handler = MongoDBLoggingHandler()
+# Load configurations
+MONGO_CONNECTION_STRING = os.getenv("MONGO_CONNECTION_STRING", "mongodb+srv://Asif_Asees:root@das-cluster.tccl6d2.mongodb.net/")
+SPARK_MASTER = os.getenv("spark://ip-172-31-32-252.ap-south-1.compute.internal:7077", "spark://0.0.0.0:7077")
+MAX_RETRIES = 3
+
+# Configure logging
+LOG_DATABASE_NAME = "das_database"
+LOG_COLLECTION_NAME = "das_logs"
+
+# Create MongoDB logging handler
+mongo_handler = MongoDBHandler(MONGO_CONNECTION_STRING, LOG_DATABASE_NAME, LOG_COLLECTION_NAME)
 mongo_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 mongo_handler.setFormatter(formatter)
 
+# Set up logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='DAS.log')
 logging.getLogger().addHandler(mongo_handler)
 
 # Initialize the scheduler
@@ -53,8 +52,8 @@ scheduler = BackgroundScheduler()
 def connect_to_mongodb(connection_string):
     try:
         client = MongoClient(connection_string)
-        database = client["DAS-database"]
-        task_collection = database["DAS-collection"]
+        database = client["das_database"]
+        task_collection = database["task"]
         failed_task_collection = database["failed_tasks"]
         logging.info("Connected to MongoDB Atlas")
         return client, database, task_collection, failed_task_collection
@@ -88,20 +87,36 @@ def fetch_failed_tasks():
         logging.error(f"Failed to fetch failed tasks from the collection: {e}")
         return []
 
+
 def run_spark_job(spark_master, recipe_id, script_path, retry_count=0, error_container=None):
     try:
-        logging.info(f"Initializing Spark session with master: {spark_master}")
-        # spark = SparkSession.builder.master(spark_master).getOrCreate()
-
         logging.info(f"Running Spark job for recipe_id: {recipe_id} using script: {script_path}")
-        with open(script_path, 'r') as file:
-            script_code = file.read()
-        exec(script_code)
-        logging.info("Spark job execution successful")
-        update_task_status(recipe_id, "success", retry_count)
-        # spark.stop()
+
+        # Execute the external script using subprocess
+        process = subprocess.Popen(["spark-submit", "--master", spark_master, script_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Capture stdout and stderr
+        stdout, stderr = process.communicate()
+
+        # Print stdout
+        print("Spark job output (stdout):")
+        print(stdout.decode("utf-8"))
+
+        # Print stderr
+        print("Spark job errors (stderr):")
+        print(stderr.decode("utf-8"))
+
+        if process.returncode == 0:
+            logging.info("Spark job execution successful")
+            update_task_status(recipe_id, "success", retry_count)
+        else:
+            raise Exception(stderr.decode("utf-8"))
+
     except Exception as e:
-        logging.error(f"Error running Spark job: {e}")
+        logging.error(f"Error running Spark job for recipe_id {recipe_id}: {e}")
+        if "Job cancelled because SparkSession was shut down" in str(e):
+            logging.error(
+                f"SparkSession was shut down for recipe_id {recipe_id}. Ensure Spark cluster is running and resources are sufficient.")
         if retry_count < MAX_RETRIES:
             retry_count += 1
             logging.info(f"Retrying task {recipe_id}, attempt {retry_count}")
@@ -112,8 +127,11 @@ def run_spark_job(spark_master, recipe_id, script_path, retry_count=0, error_con
             logging.error(f"Task {recipe_id} failed after {MAX_RETRIES} retries. Stopping periodic job.")
             scheduler.remove_job(f"{recipe_id}_job")
             if error_container:
-                error_container.error(f"Task '{recipe_id}' failed execution after {MAX_RETRIES} retries. Please check the log for errors.")
+                error_container.error(
+                    f"Task '{recipe_id}' failed execution after {MAX_RETRIES} retries. Please check the log for errors.")
         raise
+
+
 
 def update_task_status(recipe_id, status, retry_count):
     try:
@@ -150,6 +168,9 @@ def main():
         "<h1 style='text-align:center; background-color:blueviolet; color:yellow;border-radius: 20px;'>DAS USER INTERFACE</h1>",
         unsafe_allow_html=True)
 
+    scheduler.add_job(notify_status, 'interval', minutes=10)
+    scheduler.start()
+
     st.sidebar.title("TASK MANAGEMENT")
 
     st.sidebar.header("Add New Task")
@@ -159,15 +180,15 @@ def main():
     end_time = st.sidebar.time_input("End Time")
     cron_expression = st.sidebar.text_input("Cron Expression (Optional, e.g., '*/1 * * * *')")
 
-
     try:
         client, database, task_collection, failed_task_collection = connect_to_mongodb(MONGO_CONNECTION_STRING)
     except SystemExit as e:
         st.error(str(e))
         return
 
-    scheduler.add_job(notify_status, 'interval', minutes=60)
-    scheduler.start()
+    with st.expander("Important Notice:"):
+        st.warning("Please save your work regularly. The server may shut down without warning.")
+        st.info("In case of a server shutdown, you may lose unsaved work. We apologize for any inconvenience.")
 
     if st.sidebar.button("Schedule Task"):
         try:
@@ -265,4 +286,4 @@ def main():
     atexit.register(on_server_shutdown)
 
 if __name__ == "__main__":
-    main()
+        main()
